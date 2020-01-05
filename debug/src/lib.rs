@@ -3,8 +3,7 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    self, parse_macro_input, parse_quote, DeriveInput, GenericParam, Generics, Lit, Meta,
-    MetaNameValue,
+    self, parse_macro_input, parse_quote, DeriveInput, GenericParam, Lit, Meta, MetaNameValue,
 };
 
 #[proc_macro_derive(CustomDebug, attributes(debug))]
@@ -58,7 +57,84 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     });
 
-    let generics = add_trait_bounds(input.generics, phantom_data_ty);
+    let attrs = &input.attrs;
+    let custom_bounds: Option<syn::WherePredicate> = if let Some(debug) = attrs.first() {
+        assert!(debug.path.is_ident("debug"));
+        eprintln!("found debug");
+        match debug.parse_args() {
+            Ok(Meta::NameValue(nv)) => {
+                assert!(nv.path.is_ident("bound"));
+                eprintln!("found bound");
+                match nv.lit {
+                    syn::Lit::Str(lit_str) => Some(lit_str.parse().unwrap()),
+                    _ => None,
+                }
+            }
+            _ => {
+                eprintln!("failed to parse meta");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let associated_types: std::collections::HashMap<syn::Ident, syn::TypePath> = fields
+        .named
+        .iter()
+        .filter_map(|f| {
+            let segment = match &f.ty {
+                syn::Type::Path(ty) => &ty.path.segments[0],
+                _ => return None,
+            };
+
+            let argument = match &segment.arguments {
+                syn::PathArguments::AngleBracketed(bracketed) => &bracketed.args[0],
+                _ => return None,
+            };
+
+            let generic_type_path = match &argument {
+                syn::GenericArgument::Type(syn::Type::Path(type_path)) => type_path,
+                _ => return None,
+            };
+
+            if generic_type_path.path.segments.len() < 2 {
+                return None;
+            }
+
+            Some((
+                generic_type_path.path.segments[0].ident.clone(),
+                generic_type_path.clone(),
+            ))
+        })
+        .collect();
+
+    let mut generics = input.generics.clone();
+    for param in &mut generics.params {
+        if let GenericParam::Type(ref mut type_param) = *param {
+            if !phantom_data_ty.contains(&type_param.ident)
+                && associated_types.get(&type_param.ident).is_none()
+                && custom_bounds.is_none()
+            {
+                type_param.bounds.push(parse_quote!(std::fmt::Debug));
+            }
+        }
+    }
+
+    match custom_bounds {
+        Some(custom_bounds) => {
+            generics.make_where_clause().predicates.push(custom_bounds);
+        }
+        _ => {
+            associated_types.iter().for_each(|(_, assoc_ty)| {
+                generics
+                    .make_where_clause()
+                    .predicates
+                    .push(parse_quote!(#assoc_ty: std::fmt::Debug))
+            });
+        }
+    };
+
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let expanded = quote! {
@@ -93,19 +169,4 @@ fn get_format(field: &syn::Field) -> Option<String> {
         }
         _ => None,
     }
-}
-
-// Add a bound `T: HeapSize` to every type parameter T.
-fn add_trait_bounds(
-    mut generics: Generics,
-    excepts: std::collections::HashSet<syn::Ident>,
-) -> Generics {
-    for param in &mut generics.params {
-        if let GenericParam::Type(ref mut type_param) = *param {
-            if !excepts.contains(&type_param.ident) {
-                type_param.bounds.push(parse_quote!(std::fmt::Debug));
-            }
-        }
-    }
-    generics
 }
